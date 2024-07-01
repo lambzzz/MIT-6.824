@@ -69,6 +69,7 @@ const (
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	cond 	  *sync.Cond          // 日志同步条件变量
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -80,6 +81,7 @@ type Raft struct {
 
 	state int
 	heartbeats chan bool
+	applyCh chan ApplyMsg
 
 	// Persistent state on all servers
 	currentTerm int
@@ -189,66 +191,70 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 在等待投票的时候，候选人可能会从其他的服务器接收到声明它是领导人的附加条目（AppendEntries）RPC。
 	// 如果这个领导人的任期号（包含在此次的 RPC中）不小于候选人当前的任期号，那么候选人会承认领导人合法并回到跟随者状态。 
 	// 如果此次 RPC 中的任期号比自己小，那么候选人就会拒绝这次的 RPC 并且继续保持候选人状态。
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
-	// 接收心跳
-	if len(args.Entries) == 0 {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if args.Term < rf.currentTerm {
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			reply.NextIndex = len(rf.log)
-			return
-		} else {
-			reply.Term = rf.currentTerm
-			reply.Success = true
-			reply.NextIndex = len(rf.log)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 任期和状态处理
+	if args.Term < rf.currentTerm {
+		// 如果此次 RPC 中的任期号比自己小，拒绝这次的 RCP
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.NextIndex = len(rf.log)
+		return
+	} else if args.Term > rf.currentTerm {
+		reply.Term = rf.currentTerm
+		rf.state = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	} else {
+		reply.Term = rf.currentTerm
+		rf.state = Follower
+	}
 
-			rf.state = Follower
-			if args.Term > rf.currentTerm {
-				rf.currentTerm = args.Term
-				rf.votedFor = -1
-			}
+	
+	if len(rf.log)-1 < args.PrevLogIndex {
+		// Follower 的日志比 Leader 的日志短，下次从 Follower 的日志的最后一条开始比较
+		reply.Success = false
+		reply.NextIndex = len(rf.log)
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// 如果在 prevLogIndex 位置的日志条目的任期号和 prevLogTerm 不匹配，往前更新1位索引重新比较
+		reply.Success = false
+		reply.NextIndex = args.PrevLogIndex
 
-			select {
-			case rf.heartbeats <- true:
-				// fmt.Printf("Server %d received heartbeat\n", rf.me)
-			default:
+		// 当附加日志 RPC 的请求被拒绝的时候，跟随者可以(返回)冲突条目的任期号和该任期号对应的最小索引地址。
+		// 借助这些信息，领导人可以减小 nextIndex 一次性越过该冲突任期的所有日志条目；这样就变成每个任期需要一次附加条目 RPC 而不是每个条目一次。
+		for i := args.PrevLogIndex-1; i >= 0; i-- {
+			if rf.log[i].Term != rf.log[args.PrevLogIndex].Term {
+				reply.NextIndex = i + 1
+				break
 			}
-			
-			return
 		}
+	} else {
+		// 心跳 RPC 或附加日志 RPC 成功，删除冲突的日志条目并添加新的日志条目
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+		reply.Success = true
+		reply.NextIndex = len(rf.log)
 	}
 	
 
-	// if len(rf.log)-1 < args.PrevLogIndex {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	reply.NextIndex = len(rf.log)
-	// 	return
-	// }
-	// if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	reply.NextIndex = args.PrevLogIndex
-	// 	return
-	// }
-
-	// rf.mu.Lock()
-	// rf.currentTerm = args.Term
-	// rf.state = Follower
-	// rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	// if args.LeaderCommit > rf.commitIndex {
-	// 	rf.commitIndex = args.LeaderCommit
-	// }
-	// rf.mu.Unlock()
-
-	// reply.Term = rf.currentTerm
-	// reply.Success = true
-	// reply.NextIndex = len(rf.log) + len(args.Entries)
-
-	// return
+	// 领导人跟踪了最大的将会被提交的日志项的索引，并且索引值会被包含在未来的所有附加日志 RPCs （包括心跳包），这样其他的服务器才能最终知道领导人的提交位置
+	// 当 RPC 成功即领导者与跟随者的日志一致时，领导者才会尝试更新 commitIndex
+	for reply.Success && args.LeaderCommit > rf.commitIndex && args.LeaderCommit <= len(rf.log)-1 {
+		// rf.commitIndex = args.LeaderCommit
+		rf.commitIndex++
+		applymsg := ApplyMsg{
+			CommandValid: true,
+			Command: rf.log[rf.commitIndex].Command,
+			CommandIndex: rf.commitIndex,
+		}
+		rf.applyCh <- applymsg
+		// fmt.Printf("Server %d commitIndex: %d\n", rf.me, rf.commitIndex)
+	}
+	// 重置心跳计时器
+	select {
+	case rf.heartbeats <- true:
+		// fmt.Printf("Server %d received heartbeat\n", rf.me)
+	default:
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -295,7 +301,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 	}
 
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogIndex >= len(rf.log)-1 {
+	// 如果 votedFor 为空或者为 candidateId，并且候选人的日志至少和自己一样新，那么就投票给他
+	// 如果两份日志最后的条目的任期号不同，那么任期号大的日志更加新。如果两份日志最后的条目任期号相同，那么日志比较长的那个就更加新。
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && 
+	(args.LastLogTerm > rf.log[len(rf.log)-1].Term || 
+	(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
@@ -306,6 +316,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		// fmt.Printf("Server %d Vote to %d\n", rf.me, args.CandidateId)
 	} else {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
 }
@@ -365,9 +376,135 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	index = len(rf.log)
+	term = rf.currentTerm
+	isLeader = rf.state == Leader
 
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{Term: term, Command: command})
+		// rf.cond.Broadcast()
+	}
+	rf.mu.Unlock()
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) syncLogs() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			rf.mu.Lock()
+			for {
+				if rf.state != Leader {
+					rf.mu.Unlock()
+					return
+				}
+				if len(rf.log)-1 <= rf.matchIndex[server] {
+					rf.mu.Unlock()
+					time.Sleep(10 * time.Millisecond)
+					rf.mu.Lock()
+					continue
+				}
+				nextIndex := rf.nextIndex[server]
+				args := &AppendEntriesArgs{
+					Term: rf.currentTerm,
+					LeaderId: rf.me,
+					PrevLogIndex: nextIndex-1,
+					PrevLogTerm: rf.log[nextIndex-1].Term,
+					Entries: rf.log[nextIndex:],
+					LeaderCommit: rf.commitIndex,
+				}
+				rf.mu.Unlock()
+				reply := &AppendEntriesReply{}
+				ok := rf.sendAppendEntries(server, args, reply)
+				rf.mu.Lock()
+				if ok {
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.state = Follower
+						rf.votedFor = -1
+					} else if reply.Success {
+						rf.nextIndex[server] = reply.NextIndex
+						rf.matchIndex[server] = reply.NextIndex - 1
+						// fmt.Printf("Sync log %d to server %d, len: %d\n", rf.matchIndex[server], server, len(args.Entries))
+					} else {
+						rf.nextIndex[server] = reply.NextIndex
+						continue
+					}
+				}
+				rf.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				rf.mu.Lock()
+				// rf.cond.Wait()
+			}
+		}(i)
+	}
+	// commitIndex 更新
+	// 假设存在 N 满足`N > commitIndex`，使得大多数的 `matchIndex[i] ≥ N`以及`log[N].term == currentTerm` 成立，则令 `commitIndex = N`
+	go func () {
+		rf.mu.Lock()
+		for {
+			if rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			N := rf.commitIndex
+			// 从后往前遍历
+			// for i := len(rf.log)-1; i > rf.commitIndex; i-- {
+			// 	count := 1
+			// 	for j := range rf.peers {
+			// 		if j == rf.me {
+			// 			continue
+			// 		}
+			// 		if rf.matchIndex[j] >= i {
+			// 			count++
+			// 		}
+			// 	}
+			// 	if count > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+			// 		N = i
+			// 		break
+			// 	}
+			// }
+
+			// 二分查找
+			var left, right, mid int = rf.commitIndex+1, len(rf.log)-1, 0
+			for left <= right {
+				mid = (left + right) / 2
+				count := 1
+				for j := range rf.peers {
+					if j == rf.me {
+						continue
+					}
+					if rf.matchIndex[j] >= mid {
+						count++
+					}
+				}
+				if count > len(rf.peers)/2 && rf.log[mid].Term == rf.currentTerm {
+					left = mid + 1
+				} else {
+					right = mid - 1
+				}
+			}
+			N = right
+
+			for N > rf.commitIndex {
+				rf.commitIndex++
+				applymsg := ApplyMsg{
+					CommandValid: true,
+					Command: rf.log[rf.commitIndex].Command,
+					CommandIndex: rf.commitIndex,
+				}
+				rf.applyCh <- applymsg
+				// fmt.Printf("Server %d commitIndex: %d\n", rf.me, rf.commitIndex)
+			}
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			rf.mu.Lock()
+		}
+	}()
 }
 
 //
@@ -397,21 +534,19 @@ func (rf *Raft) broadcastHeartbeats() {
 			continue
 		}
 		go func(server int) {
-			rf.mu.Lock()
-			args := &AppendEntriesArgs{
-				Term: rf.currentTerm,
-				LeaderId: rf.me,
-				PrevLogIndex: len(rf.log)-1,
-				PrevLogTerm: rf.log[len(rf.log)-1].Term,
-				Entries: make([]LogEntry, 0),
-				LeaderCommit: rf.commitIndex,
-			}
-			rf.mu.Unlock()
 			for {
 				rf.mu.Lock()
 				if rf.state != Leader {
 					rf.mu.Unlock()
 					return
+				}
+				args := &AppendEntriesArgs{
+					Term: rf.currentTerm,
+					LeaderId: rf.me,
+					PrevLogIndex: len(rf.log)-1,
+					PrevLogTerm: rf.log[len(rf.log)-1].Term,
+					Entries: make([]LogEntry, 0),
+					LeaderCommit: rf.commitIndex,
 				}
 				rf.mu.Unlock()
 				reply := &AppendEntriesReply{}
@@ -421,7 +556,6 @@ func (rf *Raft) broadcastHeartbeats() {
 						rf.currentTerm = reply.Term
 						rf.state = Follower
 						rf.votedFor = -1
-						
 					} else {
 						select {
 						case rf.heartbeats <- true:
@@ -469,7 +603,13 @@ func (rf *Raft) electleader() {
 			rf.mu.Lock()
 			if atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) && rf.state == Candidate{
 				rf.state = Leader
+				// nextIndex 初始值为领导人最后的日志条目的索引+1, matchIndex 初始值为 0
+				for i := range rf.peers {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0
+				}
 				go rf.broadcastHeartbeats()
+				go rf.syncLogs()
 				// fmt.Printf("Server %d became leader\n", rf.me)
 			}
 			rf.mu.Unlock()
@@ -541,6 +681,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{
 		state: Follower,
 		heartbeats: make(chan bool, 1),
+		applyCh: applyCh,
 		currentTerm: 0,
 		votedFor: -1,
 		log: []LogEntry{{Term: 0, Command: nil}},
@@ -552,6 +693,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.cond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 
