@@ -1,13 +1,20 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	// "fmt"
+	"math/big"
+
+	"6.824/labrpc"
+)
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId int64
+	requestId int64
+	lastLeader int
 }
 
 func nrand() int64 {
@@ -21,6 +28,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.lastLeader = 0
+	ck.clientId = nrand()
+	ck.requestId = 1
 	return ck
 }
 
@@ -39,7 +49,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	clientId := ck.clientId
+	requestId := ck.requestId
+	lastLeader := ck.lastLeader
+	serverslen := len(ck.servers)
+
+	args := GetArgs{Key: key, 
+					ClientId: clientId, 
+					RequestId: requestId}
+	reply := GetReply{}
+	for {
+		reply = GetReply{}
+		ok := ck.servers[lastLeader].Call("KVServer.Get", &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				ck.lastLeader = lastLeader
+				ck.requestId++
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				ck.lastLeader = lastLeader
+				ck.requestId++
+				return ""
+			} else {
+				lastLeader = (lastLeader + 1) % serverslen
+			}
+		} else {
+			lastLeader = (lastLeader + 1) % serverslen
+		}
+	}
 }
 
 //
@@ -54,6 +91,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	clientId := ck.clientId
+	requestId := ck.requestId
+	lastLeader := ck.lastLeader
+	serverslen := len(ck.servers)
+
+	args := PutAppendArgs{Key: key, 
+						  Value: value, 
+						  Op: op, 
+						  ClientId: clientId, 
+						  RequestId: requestId}
+	reply := PutAppendReply{}
+	for {
+		reply = PutAppendReply{}
+		ok := ck.servers[lastLeader].Call("KVServer.PutAppend", &args, &reply)
+		if ok && reply.Err == OK {
+			ck.lastLeader = lastLeader
+			ck.requestId++
+			return
+		} else {
+			lastLeader = (lastLeader + 1) % serverslen
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

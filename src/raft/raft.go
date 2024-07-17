@@ -224,7 +224,7 @@ func (rf *Raft) Snapshotunlocked(index int, term int, snapshot []byte) bool {
 
 	if index <= rf.lastsnapshotIndex {
 		return false
-	} else if index < rf.lastsnapshotIndex+len(rf.log)-1 {
+	} else if index < rf.lastsnapshotIndex+len(rf.log)-1 || (index == rf.lastsnapshotIndex+len(rf.log)-1 && term == -1) {
 		snapshotoffset := index - rf.lastsnapshotIndex
 		rf.lastsnapshotIndex = index
 		rf.commitIndex = maxf(rf.commitIndex, index)
